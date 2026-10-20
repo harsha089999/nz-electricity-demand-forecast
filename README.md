@@ -1,6 +1,6 @@
 # Electricity Demand Forecast (PJM East)
 
-[![Run project](https://github.com/harsha089999/electricity-demand-forecast/actions/workflows/run.yml/badge.svg)](https://github.com/harsha089999/electricity-demand-forecast/actions/workflows/run.yml)
+[![Run project](https://github.com/harsha089999/nz-electricity-demand-forecast/actions/workflows/run.yml/badge.svg)](https://github.com/harsha089999/nz-electricity-demand-forecast/actions/workflows/run.yml)
 
 **Day-ahead hourly electricity demand forecasting on 16 years of real grid data, compared honestly against naive baselines.**
 
@@ -34,8 +34,8 @@ Real hourly electricity load for PJM East, which covers a large part of the US e
 ## Run it
 
 ```bash
-git clone https://github.com/harsha089999/electricity-demand-forecast
-cd electricity-demand-forecast
+git clone https://github.com/harsha089999/nz-electricity-demand-forecast
+cd nz-electricity-demand-forecast
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python src/main.py
@@ -116,7 +116,7 @@ Time series cleaning, leakage-free feature engineering, gradient boosting, basel
 ## Project structure
 
 ```text
-electricity-demand-forecast/
+nz-electricity-demand-forecast/
 ├── src/main.py                 # the whole pipeline
 ├── data/                       # real source data (gzipped) + data/README.md with source and licence
 ├── outputs/                    # files from the run shown above
