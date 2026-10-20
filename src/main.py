@@ -1,42 +1,50 @@
-"""Half-hourly electricity demand forecasting with lag/calendar/weather features."""
+"""Day-ahead hourly electricity demand forecasting on real PJM East data.
+
+Data: PJM Interconnection, PJM East region hourly load in megawatts (2002 to Aug 2018), published on Kaggle as
+robikscube/hourly-energy-consumption (PJME_hourly.csv). Stored in data/PJME_hourly.csv.gz.
+
+Every feature is known at least 24 hours ahead (calendar plus lags of 1 day or more), so the model is a fair
+day-ahead forecast, not a one-step-ahead one.
+"""
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 ROOT = Path(__file__).resolve().parents[1]
+DATA = ROOT / "data" / "PJME_hourly.csv.gz"
 OUT = ROOT / "outputs"
 OUT.mkdir(exist_ok=True)
-HOLIDAYS = pd.to_datetime(["2025-12-25", "2025-12-26", "2026-01-01", "2026-01-02", "2026-02-06",
-                           "2026-04-03", "2026-04-06", "2026-04-27", "2026-06-01", "2026-07-10",
-                           "2026-10-26", "2025-11-14"])
+TRAIN_START, TRAIN_END, TEST_START = "2012-01-01", "2017-07-01", "2017-08-01"  # July held back as a gap
 
 
-def make_data(seed=5):
-    rng = np.random.default_rng(seed)
-    ts = pd.date_range("2025-10-01", "2026-10-15 23:30", freq="30min")
-    doy = ts.dayofyear.to_numpy()
-    hour = ts.hour.to_numpy() + ts.minute.to_numpy() / 60
-    temp = 11 - 6 * np.cos((doy - 20) / 365 * 2 * np.pi) + 4 * np.sin((hour - 9) / 24 * 2 * np.pi) \
-        + rng.normal(0, 1.5, len(ts))
-    daily = 300 * np.exp(-((hour - 8) ** 2) / 4) + 380 * np.exp(-((hour - 18.5) ** 2) / 5)
-    weekend = np.isin(ts.dayofweek, [5, 6]) | ts.normalize().isin(HOLIDAYS)
-    heating = 35 * np.clip(14 - temp, 0, None)
-    demand = 1600 + daily * np.where(weekend, 0.75, 1.0) + heating + rng.normal(0, 30, len(ts))
-    return pd.DataFrame({"ts": ts, "temp_c": temp.round(1), "demand_mw": demand.round(1)})
+def load():
+    raw = pd.read_csv(DATA, parse_dates=["Datetime"]).rename(columns={"Datetime": "ts", "PJME_MW": "demand_mw"})
+    dupes = raw.ts.duplicated().sum()
+    # daylight-saving changes create duplicate hours; average them
+    df = raw.groupby("ts", as_index=False).demand_mw.mean().set_index("ts").sort_index()
+    full = pd.date_range(df.index.min(), df.index.max(), freq="h")
+    missing = len(full) - len(df)
+    df = df.reindex(full).interpolate(limit=3)  # fill short gaps only
+    df.index.name = "ts"
+    print(f"Raw rows {len(raw):,}; duplicate timestamps averaged: {dupes}; missing hours filled: {missing}")
+    return df.reset_index()
 
 
 def features(df):
     df = df.copy()
-    df["hh"] = df.ts.dt.hour * 2 + df.ts.dt.minute // 30
+    hol = USFederalHolidayCalendar().holidays(df.ts.min(), df.ts.max())
+    df["hour"] = df.ts.dt.hour
     df["dow"] = df.ts.dt.dayofweek
     df["month"] = df.ts.dt.month
-    df["holiday"] = df.ts.dt.normalize().isin(HOLIDAYS).astype(int)
-    df["heating_deg"] = np.clip(14 - df.temp_c, 0, None)
-    df["lag_1d"] = df.demand_mw.shift(48)
-    df["lag_7d"] = df.demand_mw.shift(336)
-    df["roll_mean_1d_lagged"] = df.demand_mw.shift(48).rolling(48).mean()
+    df["doy"] = df.ts.dt.dayofyear
+    df["holiday"] = df.ts.dt.normalize().isin(hol).astype(int)
+    df["lag_1d"] = df.demand_mw.shift(24)
+    df["lag_7d"] = df.demand_mw.shift(168)
+    df["roll_mean_1d_lagged"] = df.demand_mw.shift(24).rolling(24).mean()
+    df["roll_max_1d_lagged"] = df.demand_mw.shift(24).rolling(24).max()
     return df.dropna()
 
 
@@ -45,23 +53,33 @@ def mape(y, p):
 
 
 def main():
-    df = features(make_data())
-    feats = ["hh", "dow", "month", "holiday", "temp_c", "heating_deg", "lag_1d", "lag_7d", "roll_mean_1d_lagged"]
-    train = df[df.ts < "2026-08-01"]
-    test = df[df.ts >= "2026-09-01"]  # August held back as a gap/validation month
+    df = features(load())
+    feats = ["hour", "dow", "month", "doy", "holiday", "lag_1d", "lag_7d", "roll_mean_1d_lagged", "roll_max_1d_lagged"]
+    train = df[(df.ts >= TRAIN_START) & (df.ts < TRAIN_END)]
+    test = df[df.ts >= TEST_START]
+    print(f"Train {train.ts.min():%Y-%m-%d} to {train.ts.max():%Y-%m-%d} ({len(train):,} h); "
+          f"test {test.ts.min():%Y-%m-%d} to {test.ts.max():%Y-%m-%d} ({len(test):,} h)\n")
 
-    model = HistGradientBoostingRegressor(max_iter=400, learning_rate=0.05, random_state=0)
+    model = HistGradientBoostingRegressor(max_iter=500, learning_rate=0.05, random_state=0)
     model.fit(train[feats], train.demand_mw)
-    test = test.assign(pred_gbm=model.predict(test[feats]).round(1), pred_naive=test.lag_7d)
+    test = test.assign(pred_gbm=model.predict(test[feats]).round(1),
+                       pred_naive_1d=test.lag_1d, pred_naive_7d=test.lag_7d)
 
-    print(f"Naive (same time last week) MAPE: {mape(test.demand_mw, test.pred_naive):.2f}%")
-    print(f"Gradient boosting MAPE:            {mape(test.demand_mw, test.pred_gbm):.2f}%")
+    print(f"Naive (same hour yesterday) MAPE: {mape(test.demand_mw, test.pred_naive_1d):.2f}%")
+    print(f"Naive (same hour last week) MAPE: {mape(test.demand_mw, test.pred_naive_7d):.2f}%")
+    print(f"Gradient boosting MAPE:           {mape(test.demand_mw, test.pred_gbm):.2f}%")
 
-    by_hour = (test.assign(hour=test.ts.dt.hour, ape=(test.demand_mw - test.pred_gbm).abs() / test.demand_mw * 100)
-               .groupby("hour").ape.mean().round(2).rename("mape_pct").reset_index())
+    t = test.assign(ape=(test.demand_mw - test.pred_gbm).abs() / test.demand_mw * 100)
+    by_hour = t.groupby("hour").ape.mean().round(2).rename("mape_pct").reset_index()
+    by_month = (t.groupby(t.ts.dt.to_period("M").astype(str).rename("month")).ape.mean().round(2)
+                .rename("mape_pct").reset_index())
     by_hour.to_csv(OUT / "error_by_hour.csv", index=False)
-    test[["ts", "demand_mw", "pred_naive", "pred_gbm", "temp_c", "holiday"]].to_csv(OUT / "predictions.csv", index=False)
-    print("Worst hours:", by_hour.nlargest(3, "mape_pct").to_dict("records"))
+    by_month.to_csv(OUT / "error_by_month.csv", index=False)
+    test[["ts", "demand_mw", "pred_naive_1d", "pred_naive_7d", "pred_gbm", "holiday"]].to_csv(
+        OUT / "predictions.csv.gz", index=False)
+    print("\nError by month:\n" + by_month.to_string(index=False))
+    worst_days = t.groupby(t.ts.dt.date).ape.mean().nlargest(5).round(1)
+    print("\nWorst 5 days (mean APE %):\n" + worst_days.to_string())
 
 
 if __name__ == "__main__":
